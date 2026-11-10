@@ -1,0 +1,35 @@
+Start testing: Nov 10 11:46 MST
+----------------------------------------------------------
+1/1 Testing: aether_tests
+1/1 Test: aether_tests
+Command: "/Users/mianather3/projects/aether_lob/build/aether_tests"
+Directory: /Users/mianather3/projects/aether_lob/build
+"aether_tests" start time: Nov 10 11:46 MST
+Output:
+----------------------------------------------------------
+[ RUN  ] layout
+[  OK  ] layout
+[ RUN  ] empty_and_rejects
+[  OK  ] empty_and_rejects
+[ RUN  ] price_priority_and_level_order
+[  OK  ] price_priority_and_level_order
+[ RUN  ] fifo_time_priority
+[  OK  ] fifo_time_priority
+[ RUN  ] partial_fill_rests_remainder
+[  OK  ] partial_fill_rests_remainder
+[ RUN  ] arena_exhaustion_and_reuse
+[  OK  ] arena_exhaustion_and_reuse
+[ RUN  ] differential_against_reference
+    (151496 trades, 26291 resting orders, 28 levels at end)
+[  OK  ] differential_against_reference
+
+ALL TESTS PASSED (0 failures)
+<end of output>
+Test time =   0.28 sec
+----------------------------------------------------------
+Test Passed.
+"aether_tests" end time: Nov 10 11:46 MST
+"aether_tests" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Nov 10 11:46 MST

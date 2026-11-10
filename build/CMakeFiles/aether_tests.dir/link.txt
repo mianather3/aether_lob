@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/aether_tests.dir/tests/test_order_book.cpp.o -o aether_tests  libaether_lob.a
