@@ -68,10 +68,44 @@ find_package(Threads REQUIRED)
 add_library(aether_lob STATIC
     src/arena.cpp
     src/order_book.cpp
-    src/engine.cpp)
+    src/engine.cpp
+    src/network_gateway.cpp)
 add_library(aether::lob ALIAS aether_lob)
 target_include_directories(aether_lob PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(aether_lob PUBLIC aether_options Threads::Threads)
+
+# ---- Platform capabilities ---------------------------------------------------
+# Threads::Threads supplies -pthread / libpthread where the platform needs it
+# (Linux); on Darwin pthreads live in libSystem. The Mach affinity calls are
+# libSystem too, so macOS needs no extra framework - the checks below confirm
+# the APIs are really there rather than assuming it from the OS name.
+include(CheckIncludeFileCXX)
+include(CheckCXXSymbolExists)
+check_include_file_cxx(sys/epoll.h AETHER_HAVE_EPOLL)
+check_include_file_cxx(sys/event.h AETHER_HAVE_KQUEUE)
+if(AETHER_HAVE_EPOLL)
+    target_compile_definitions(aether_lob PRIVATE AETHER_HAVE_EPOLL=1)
+elseif(AETHER_HAVE_KQUEUE)
+    target_compile_definitions(aether_lob PRIVATE AETHER_HAVE_KQUEUE=1)
+else()
+    message(STATUS "AetherLOB: no epoll or kqueue found, network gateway will use poll()")
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+    set(CMAKE_REQUIRED_LIBRARIES Threads::Threads)
+    check_cxx_symbol_exists(pthread_setaffinity_np pthread.h AETHER_HAVE_PTHREAD_AFFINITY)
+    unset(CMAKE_REQUIRED_DEFINITIONS)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if(NOT AETHER_HAVE_PTHREAD_AFFINITY)
+        message(FATAL_ERROR "AetherLOB: pthread_setaffinity_np is required on Linux")
+    endif()
+elseif(APPLE)
+    check_cxx_symbol_exists(thread_policy_set "mach/mach.h;mach/thread_policy.h" AETHER_HAVE_MACH_AFFINITY)
+    if(NOT AETHER_HAVE_MACH_AFFINITY)
+        message(FATAL_ERROR "AetherLOB: Mach thread_policy_set is required on Darwin")
+    endif()
+endif()
 
 # ---- Tests -------------------------------------------------------------------
 include(CTest)
@@ -88,6 +122,23 @@ endfunction()
 aether_add_test(aether_tests tests/test_order_book.cpp)
 aether_add_test(aether_test_spsc_queue tests/test_spsc_queue.cpp)
 aether_add_test(aether_test_engine tests/test_engine.cpp)
+aether_add_test(aether_test_network_gateway tests/test_network_gateway.cpp)
+
+# Differential fuzzer. Usage: aether_fuzz_pipeline [payloads] [seed]
+# The CTest run is sized to stay quick under the sanitizers; run the binary
+# directly for longer campaigns.
+if(AETHER_SANITIZER STREQUAL "none")
+    set(AETHER_FUZZ_PAYLOADS_DEFAULT 1000000)
+else()
+    set(AETHER_FUZZ_PAYLOADS_DEFAULT 250000)
+endif()
+set(AETHER_FUZZ_PAYLOADS ${AETHER_FUZZ_PAYLOADS_DEFAULT} CACHE STRING "Payloads fed by the CTest fuzz run")
+add_executable(aether_fuzz_pipeline tests/fuzz_pipeline.cpp)
+target_link_libraries(aether_fuzz_pipeline PRIVATE aether::lob)
+add_test(NAME aether_fuzz_pipeline COMMAND aether_fuzz_pipeline ${AETHER_FUZZ_PAYLOADS})
+set_tests_properties(aether_fuzz_pipeline PROPERTIES
+    ENVIRONMENT "TSAN_OPTIONS=halt_on_error=1;ASAN_OPTIONS=halt_on_error=1;UBSAN_OPTIONS=halt_on_error=1"
+    TIMEOUT 1800)
 
 # ---- Benchmarks --------------------------------------------------------------
 add_executable(aether_bench bench/bench_order_book.cpp)

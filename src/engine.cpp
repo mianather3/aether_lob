@@ -1,7 +1,9 @@
 #include "engine.hpp"
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
+#include <stdexcept>
 
 #include <poll.h>
 #include <unistd.h>
@@ -21,7 +23,13 @@ Engine::Engine(const EngineConfig& config, EngineListener* listener)
     : config_(config),
       listener_(listener != nullptr ? listener : &null_listener()),
       queue_(config.queue_capacity),
-      book_(config.book) {}
+      book_(config.book) {
+    if (config.matching_core >= 0 && config.gateway_core >= 0 &&
+        same_physical_core(config.matching_core, config.gateway_core)) {
+        throw std::invalid_argument(
+            "aether::Engine: matching_core and gateway_core must be different physical cores");
+    }
+}
 
 Engine::~Engine() { stop(); }
 
@@ -31,8 +39,12 @@ void Engine::start() {
     }
     stop_matching_.store(false, std::memory_order_release);
     stop_gateway_.store(false, std::memory_order_release);
+    matching_ready_.store(false, std::memory_order_release);
     running_.store(true, std::memory_order_release);
     matching_thread_ = std::thread([this] { matching_loop(); });
+    while (!matching_ready_.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
 }
 
 void Engine::stop() noexcept {
@@ -73,6 +85,14 @@ void Engine::apply(const Command& command) noexcept {
 }
 
 void Engine::matching_loop() noexcept {
+    // Placement happens here, once, before the first poll: nothing below this
+    // block ever looks at affinity again.
+    matching_pin_ = pin_current_thread(config_.matching_core);
+    if (config_.log_affinity && config_.matching_core >= 0) {
+        log_pin(stderr, "matching-engine thread", matching_pin_);
+    }
+    matching_ready_.store(true, std::memory_order_release);
+
     Command command;
     std::uint32_t idle = 0;
     for (;;) {
@@ -169,6 +189,11 @@ void Engine::gateway_loop(int fd) noexcept {
     // across two reads is carried over at the front.
     std::byte buffer[1U << 16];
     std::size_t have = 0;
+
+    const PinResult pin = pin_current_thread(config_.gateway_core);
+    if (config_.log_affinity && config_.gateway_core >= 0) {
+        log_pin(stderr, "gateway thread", pin);
+    }
 
     while (!stop_gateway_.load(std::memory_order_acquire)) {
         pollfd pfd{fd, POLLIN, 0};

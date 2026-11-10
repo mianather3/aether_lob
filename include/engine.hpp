@@ -19,6 +19,7 @@
 #include <span>
 #include <thread>
 
+#include "affinity.hpp"
 #include "order_book.hpp"
 #include "protocol.hpp"
 #include "spsc_queue.hpp"
@@ -58,6 +59,12 @@ struct EngineConfig {
     // yielding the core. Raise it on a dedicated, isolated core.
     std::uint32_t idle_spins_before_yield = 1U << 14;
     bool stamp_ingress = true;  // gateway writes Command::ingress_ns (one clock read per message)
+    // Thread placement (see affinity.hpp; -1 = unpinned). When both are set
+    // they must name different physical cores. gateway_core applies to the
+    // thread spawned by start_gateway() and is the default for NetworkGateway.
+    int matching_core = -1;
+    int gateway_core = -1;
+    bool log_affinity = true;  // one stderr line per pinned thread at start-up
 };
 
 struct IngestResult {
@@ -77,13 +84,16 @@ struct GatewayStats {
 
 class Engine {
 public:
+    // Throws std::invalid_argument if matching_core and gateway_core are both
+    // set but cannot give the two threads separate physical cores.
     explicit Engine(const EngineConfig& config = {}, EngineListener* listener = nullptr);
     ~Engine();  // stop()s if still running
 
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
 
-    // Spawns the matching thread. No-op if already running.
+    // Spawns the matching thread and returns once it has applied (and
+    // verified) its core affinity. No-op if already running.
     void start();
 
     // Graceful shutdown: stops and joins the gateway thread (if any), then lets
@@ -129,6 +139,13 @@ public:
         return backpressure_.load(std::memory_order_acquire);
     }
     [[nodiscard]] std::size_t queue_capacity() const noexcept { return queue_.capacity(); }
+    [[nodiscard]] std::size_t queue_depth() const noexcept { return queue_.size_approx(); }
+    [[nodiscard]] const EngineConfig& config() const noexcept { return config_; }
+
+    // Outcome of pinning the matching thread; meaningful once start() has returned.
+    [[nodiscard]] PinResult matching_affinity() const noexcept {
+        return matching_ready_.load(std::memory_order_acquire) ? matching_pin_ : PinResult{};
+    }
 
     // The book belongs to the matching thread: only read it after stop().
     [[nodiscard]] const OrderBook& book() const noexcept { return book_; }
@@ -159,6 +176,8 @@ private:
     alignas(kCacheLine) std::atomic<bool> running_{false};
     std::atomic<bool> stop_matching_{false};
     std::atomic<bool> stop_gateway_{false};
+    std::atomic<bool> matching_ready_{false};
+    PinResult matching_pin_{};  // written by the matching thread before matching_ready_
 
     std::thread matching_thread_;
     std::thread gateway_thread_;
