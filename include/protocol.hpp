@@ -119,11 +119,13 @@ struct Command {
     OrderId order_id{0};
     Price price{0};
     Qty qty{0};
-    std::uint64_t ingress_ns{0};  // gateway timestamp at queue insertion (0 = unstamped)
+    // Hardware timestamps in tsc::now() ticks (see tsc_timer.hpp); 0 = unstamped.
+    std::uint64_t rx_ticks{0};       // the gateway received the packet carrying this message
+    std::uint64_t enqueue_ticks{0};  // the gateway pushed this command to the engine queue
     CommandType type{CommandType::Add};
     Side side{Side::Buy};
 };
-static_assert(std::is_trivially_copyable_v<Command> && sizeof(Command) == 40);
+static_assert(std::is_trivially_copyable_v<Command> && sizeof(Command) == 48);
 
 enum class DecodeStatus : std::uint8_t {
     Ok,

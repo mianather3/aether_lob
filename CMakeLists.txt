@@ -69,7 +69,8 @@ add_library(aether_lob STATIC
     src/arena.cpp
     src/order_book.cpp
     src/engine.cpp
-    src/network_gateway.cpp)
+    src/network_gateway.cpp
+    src/market_snapshot.cpp)
 add_library(aether::lob ALIAS aether_lob)
 target_include_directories(aether_lob PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(aether_lob PUBLIC aether_options Threads::Threads)
@@ -123,6 +124,7 @@ aether_add_test(aether_tests tests/test_order_book.cpp)
 aether_add_test(aether_test_spsc_queue tests/test_spsc_queue.cpp)
 aether_add_test(aether_test_engine tests/test_engine.cpp)
 aether_add_test(aether_test_network_gateway tests/test_network_gateway.cpp)
+aether_add_test(aether_test_telemetry tests/test_telemetry.cpp)
 
 # Differential fuzzer. Usage: aether_fuzz_pipeline [payloads] [seed]
 # The CTest run is sized to stay quick under the sanitizers; run the binary
@@ -146,3 +148,7 @@ target_link_libraries(aether_bench PRIVATE aether::lob)
 
 add_executable(aether_bench_pipeline bench/bench_pipeline.cpp)
 target_link_libraries(aether_bench_pipeline PRIVATE aether::lob)
+
+# Latency profiler. Usage: aether_bench_latency_profile [--json FILE] [rates...]
+add_executable(aether_bench_latency_profile bench/bench_latency_profile.cpp)
+target_link_libraries(aether_bench_latency_profile PRIVATE aether::lob)

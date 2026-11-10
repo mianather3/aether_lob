@@ -509,6 +509,17 @@ bool verify(const aether::Engine& engine, const Recorder& recorder, const aether
     EXPECT(engine.submitted() == model.messages);
     EXPECT(engine.processed() == model.messages);
 
+    // Telemetry counters must tell the same story as the reference model.
+    const aether::TelemetrySnapshot metrics = engine.metrics();
+    std::uint64_t model_volume = 0;
+    std::uint64_t model_rejected = 0;
+    for (const ref::Fill& fill : expected.fills) model_volume += fill.qty;
+    for (const ref::Outcome& outcome : expected.outcomes) model_rejected += outcome.result != ref::Result::Ok;
+    EXPECT(metrics.received == model.messages && metrics.dropped_queue_full == 0);
+    EXPECT(metrics.accepted + metrics.rejected == model.messages && metrics.rejected == model_rejected);
+    EXPECT(metrics.trades == expected.fills.size() && metrics.volume == model_volume);
+    EXPECT(metrics.queue_to_match.count == model.messages && metrics.checksum_errors == 0);
+
     // Per-command outcomes, in order.
     EXPECT(recorder.outcomes.size() == expected.outcomes.size());
     for (std::size_t i = 0; i < expected.outcomes.size(); ++i) {
@@ -536,6 +547,7 @@ bool verify(const aether::Engine& engine, const Recorder& recorder, const aether
                got_book[i].id == want_book[i].id && got_book[i].qty == want_book[i].qty);
     }
     EXPECT(engine.book().order_count() == want_book.size());
+    EXPECT(metrics.resting_orders == want_book.size() && metrics.levels == engine.book().level_count());
     EXPECT(engine.book().check_invariants());
 
     totals.messages += model.messages;

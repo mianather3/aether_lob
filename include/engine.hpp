@@ -16,13 +16,17 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <span>
 #include <thread>
 
 #include "affinity.hpp"
+#include "market_snapshot.hpp"
 #include "order_book.hpp"
 #include "protocol.hpp"
 #include "spsc_queue.hpp"
+#include "telemetry.hpp"
+#include "tsc_timer.hpp"
 
 namespace aether {
 
@@ -58,13 +62,18 @@ struct EngineConfig {
     // Consecutive empty polls the matching thread busy-spins before it starts
     // yielding the core. Raise it on a dedicated, isolated core.
     std::uint32_t idle_spins_before_yield = 1U << 14;
-    bool stamp_ingress = true;  // gateway writes Command::ingress_ns (one clock read per message)
+    // Hardware-timestamp every command (gateway receive, queue insertion,
+    // dequeue, match completion) and feed the latency histograms: four
+    // counter reads per message. false leaves the stamps at 0 and records no
+    // latency; the message/execution counters are kept either way.
+    bool stamp_ingress = true;
     // Thread placement (see affinity.hpp; -1 = unpinned). When both are set
     // they must name different physical cores. gateway_core applies to the
     // thread spawned by start_gateway() and is the default for NetworkGateway.
     int matching_core = -1;
     int gateway_core = -1;
     bool log_affinity = true;  // one stderr line per pinned thread at start-up
+    std::uint32_t snapshot_depth = 10;  // price levels per side in an L2 snapshot (<= kMaxSnapshotDepth)
 };
 
 struct IngestResult {
@@ -113,8 +122,14 @@ public:
     // running (nothing would ever drain it).
     bool submit(const Command& command) noexcept;
 
-    // Decodes every complete wire message in `bytes` and submit()s it.
+    // Decodes every complete wire message in `bytes` and submit()s it. One
+    // call is one "packet" for telemetry: all of its messages share a receive
+    // timestamp. Bytes from an invalid message onward are counted as invalid.
     IngestResult ingest(std::span<const std::byte> bytes) noexcept;
+
+    // For framing layers: counts wire bytes they discard themselves, such as
+    // a datagram's or a closed stream's incomplete trailing message.
+    void note_invalid_bytes(std::size_t count) noexcept { telemetry_.gateway.invalid_bytes.add(count); }
 
     // Spawns the gateway thread: reads wire bytes from a POSIX fd (stream
     // socket, pipe, ...) until EOF, stop(), an I/O error or a protocol error.
@@ -150,10 +165,25 @@ public:
     // The book belongs to the matching thread: only read it after stop().
     [[nodiscard]] const OrderBook& book() const noexcept { return book_; }
 
+    // ---- Telemetry (any thread, any time; never blocks a pipeline thread) -------
+    [[nodiscard]] const Telemetry& telemetry() const noexcept { return telemetry_; }
+    [[nodiscard]] TelemetrySnapshot metrics() const noexcept { return telemetry_.snapshot(); }
+
+    // Copies the top snapshot_depth levels of each side into `out`. While the
+    // engine runs, the matching thread takes the copy on its next idle spin or
+    // telemetry flush and this call waits for it (returns false on timeout).
+    // On a stopped engine it reads the book directly. Callable from any number
+    // of exporter threads, but not concurrently with start()/stop().
+    bool snapshot(L2Snapshot& out, int timeout_ms = 1000);
+    [[nodiscard]] std::uint64_t snapshots_served() const noexcept { return snapshots_.served_count(); }
+
 private:
     void matching_loop() noexcept;
     void gateway_loop(int fd) noexcept;
-    void apply(const Command& command) noexcept;
+    void apply(const Command& command, std::uint64_t dequeue_ticks) noexcept;
+    void publish_matching() noexcept;
+    bool push(const Command& command) noexcept;
+    bool push_or_wait(const Command& command) noexcept;
 
     const EngineConfig config_;
     EngineListener* listener_;
@@ -171,6 +201,14 @@ private:
     // Consumer-side state.
     alignas(kCacheLine) std::atomic<std::uint64_t> processed_{0};
     std::uint64_t processed_local_{0};
+    struct {  // matching thread's private tallies, flushed to telemetry_ in batches
+        std::uint64_t accepted{0}, rejected{0}, trades{0}, volume{0};
+        std::uint32_t unpublished{0};
+    } tally_;
+
+    Telemetry telemetry_;        // each block is cache-aligned and single-writer
+    SnapshotChannel snapshots_;
+    std::mutex snapshot_mutex_;  // exporter threads only; the pipeline never takes it
 
     // Control flags (cold).
     alignas(kCacheLine) std::atomic<bool> running_{false};

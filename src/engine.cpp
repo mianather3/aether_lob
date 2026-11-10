@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 
@@ -29,6 +30,7 @@ Engine::Engine(const EngineConfig& config, EngineListener* listener)
         throw std::invalid_argument(
             "aether::Engine: matching_core and gateway_core must be different physical cores");
     }
+    tsc::calibrate();  // once per process, before any thread converts ticks
 }
 
 Engine::~Engine() { stop(); }
@@ -63,8 +65,12 @@ void Engine::stop() noexcept {
 
 // ---- Matching thread ----------------------------------------------------------
 
-void Engine::apply(const Command& command) noexcept {
-    const auto on_trade = [this, &command](const Trade& trade) noexcept {
+void Engine::apply(const Command& command, std::uint64_t dequeue_ticks) noexcept {
+    std::uint64_t fills = 0;
+    std::uint64_t volume = 0;
+    const auto on_trade = [&](const Trade& trade) noexcept {
+        ++fills;
+        volume += trade.qty;
         listener_->on_trade(trade, command);
     };
 
@@ -80,8 +86,48 @@ void Engine::apply(const Command& command) noexcept {
             result = book_.add_market(command.side, command.qty, on_trade);
             break;
     }
+
+    // Close the interval before anything else runs, then account for it. All
+    // of this is single-writer arithmetic on memory this thread owns.
+    if (dequeue_ticks != 0 && command.enqueue_ticks != 0) {
+        const std::uint64_t done = tsc::now_end();
+        telemetry_.ingest_to_queue.record(tsc::elapsed_ns(command.rx_ticks, command.enqueue_ticks));
+        telemetry_.queue_to_match.record(tsc::elapsed_ns(command.enqueue_ticks, done));
+        telemetry_.match_service.record(tsc::elapsed_ns(dequeue_ticks, done));
+        if (fills != 0) {
+            telemetry_.tick_to_trade.record(tsc::elapsed_ns(command.rx_ticks, done));
+        }
+    }
+    if (result.status == Status::Ok) {
+        ++tally_.accepted;
+    } else {
+        ++tally_.rejected;
+    }
+    tally_.trades += fills;
+    tally_.volume += volume;
+
     listener_->on_processed(command, result);
     processed_.store(++processed_local_, std::memory_order_release);
+    if (++tally_.unpublished >= MatchingCounters::kPublishInterval) {
+        publish_matching();
+    }
+}
+
+// Flushes the private tallies to the shared counters and serves a pending
+// snapshot request. Runs when the queue goes empty and every kPublishInterval
+// commands, so under sustained load both are at most that many commands late.
+void Engine::publish_matching() noexcept {
+    MatchingCounters& m = telemetry_.matching;
+    m.accepted.add(tally_.accepted);
+    m.rejected.add(tally_.rejected);
+    m.trades.add(tally_.trades);
+    m.volume.add(tally_.volume);
+    m.resting_orders.set(book_.order_count());
+    m.levels.set(book_.level_count());
+    tally_ = {};
+    if (snapshots_.requested()) {
+        snapshots_.serve(book_, config_.snapshot_depth, processed_local_);
+    }
 }
 
 void Engine::matching_loop() noexcept {
@@ -93,20 +139,28 @@ void Engine::matching_loop() noexcept {
     }
     matching_ready_.store(true, std::memory_order_release);
 
+    const bool stamp = config_.stamp_ingress;
     Command command;
     std::uint32_t idle = 0;
     for (;;) {
         if (queue_.try_pop(command)) {
-            apply(command);
+            apply(command, stamp ? tsc::now() : 0);
             idle = 0;
             continue;
+        }
+        // Idle: the moment to publish batched counters and serve snapshots.
+        if (tally_.unpublished != 0) {
+            publish_matching();
+        } else if (snapshots_.requested()) {
+            snapshots_.serve(book_, config_.snapshot_depth, processed_local_);
         }
         if (stop_matching_.load(std::memory_order_acquire)) {
             // The producer was quiesced before the flag was set, so one more
             // pass is guaranteed to see everything that was ever enqueued.
             while (queue_.try_pop(command)) {
-                apply(command);
+                apply(command, stamp ? tsc::now() : 0);
             }
+            publish_matching();
             return;
         }
         if (idle < config_.idle_spins_before_yield) {
@@ -120,7 +174,7 @@ void Engine::matching_loop() noexcept {
 
 // ---- Gateway (producer) --------------------------------------------------------
 
-bool Engine::try_submit(const Command& command) noexcept {
+bool Engine::push(const Command& command) noexcept {
     if (!queue_.try_push(command)) {
         return false;
     }
@@ -128,14 +182,30 @@ bool Engine::try_submit(const Command& command) noexcept {
     return true;
 }
 
+bool Engine::try_submit(const Command& command) noexcept {
+    telemetry_.gateway.received.add(1);
+    if (push(command)) [[likely]] {
+        return true;
+    }
+    telemetry_.gateway.dropped_queue_full.add(1);
+    return false;
+}
+
 bool Engine::submit(const Command& command) noexcept {
-    if (try_submit(command)) [[likely]] {
+    telemetry_.gateway.received.add(1);
+    return push_or_wait(command);
+}
+
+bool Engine::push_or_wait(const Command& command) noexcept {
+    if (push(command)) [[likely]] {
         return true;
     }
     backpressure_.store(++backpressure_local_, std::memory_order_release);
+    telemetry_.gateway.backpressure_waits.add(1);
     std::uint32_t spins = 0;
-    while (!try_submit(command)) {
+    while (!push(command)) {
         if (!running_.load(std::memory_order_acquire)) {
+            telemetry_.gateway.dropped_queue_full.add(1);  // nothing will ever drain the queue
             return false;
         }
         if (++spins < 1024) {
@@ -149,22 +219,63 @@ bool Engine::submit(const Command& command) noexcept {
 
 IngestResult Engine::ingest(std::span<const std::byte> bytes) noexcept {
     IngestResult result{0, 0, DecodeStatus::Ok};
+    const bool stamp = config_.stamp_ingress;
+    const std::uint64_t rx_ticks = stamp ? tsc::now() : 0;  // one receive stamp per packet
+    std::uint64_t offered = 0;
     Command command;
     while (result.consumed < bytes.size()) {
         const DecodeResult decoded = decode(bytes.subspan(result.consumed), command);
         if (decoded.status != DecodeStatus::Ok) {
             result.status = decoded.status;
-            return result;
+            if (decoded.status != DecodeStatus::NeedMoreData) {
+                // An invalid message makes everything after it unusable.
+                telemetry_.gateway.invalid_bytes.add(bytes.size() - result.consumed);
+            }
+            break;
         }
-        command.ingress_ns = config_.stamp_ingress ? now_ns() : 0;
-        if (!submit(command)) {
+        command.rx_ticks = rx_ticks;
+        command.enqueue_ticks = stamp ? tsc::now() : 0;
+        ++offered;
+        if (!push_or_wait(command)) {
             result.status = DecodeStatus::NeedMoreData;  // not enqueued: caller keeps the bytes
-            return result;
+            break;
         }
         result.consumed += decoded.consumed;
         ++result.messages;
     }
+    // Counters are settled once per packet, not once per message.
+    GatewayCounters& g = telemetry_.gateway;
+    g.packets.add(1);
+    g.bytes.add(result.consumed);
+    g.received.add(offered);
     return result;
+}
+
+bool Engine::snapshot(L2Snapshot& out, int timeout_ms) {
+    const std::lock_guard<std::mutex> lock(snapshot_mutex_);  // one outstanding request at a time
+    if (!running()) {
+        capture_l2(book_, config_.snapshot_depth, processed(), out);  // no matching thread: the book is quiescent
+        return true;
+    }
+    const std::uint64_t ticket = snapshots_.request();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (std::uint32_t spins = 0; !snapshots_.served(ticket) && running(); ++spins) {
+        if (spins < 2000) {
+            std::this_thread::yield();
+        } else {
+            if (std::chrono::steady_clock::now() > deadline) {
+                return false;  // the late capture is harmless: the next request waits for its own
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    }
+    if (snapshots_.served(ticket)) {
+        out = snapshots_.front();
+        return true;
+    }
+    // The matching thread exited (and was joined) without serving the request.
+    capture_l2(book_, config_.snapshot_depth, processed(), out);
+    return true;
 }
 
 bool Engine::start_gateway(int fd) {
@@ -216,6 +327,7 @@ void Engine::gateway_loop(int fd) noexcept {
         }
         if (got == 0) {  // EOF: a leftover partial message means a truncated stream
             gateway_stats_.status = have == 0 ? DecodeStatus::Ok : DecodeStatus::NeedMoreData;
+            note_invalid_bytes(have);
             return;
         }
         have += static_cast<std::size_t>(got);

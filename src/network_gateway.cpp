@@ -377,6 +377,9 @@ void NetworkGateway::on_datagram(std::span<const std::byte> datagram) noexcept {
             Command probe;
             const bool refused = decode(datagram.subspan(result.consumed), probe).status == DecodeStatus::Ok;
             ++local_[refused ? kDropped : kUdpTruncated];
+            if (!refused) {
+                engine_.note_invalid_bytes(datagram.size() - result.consumed);
+            }
         }
     }
     if (!threaded_) {
@@ -464,6 +467,7 @@ bool NetworkGateway::consume_stream(Connection& connection) noexcept {
 void NetworkGateway::end_stream(Connection& connection) noexcept {
     if (connection.have != 0) {
         ++local_[kTcpTruncated];
+        engine_.note_invalid_bytes(connection.have);  // the unfinished trailing message
     }
     if (connection.fd >= 0) {
         poller_->remove(connection.fd);

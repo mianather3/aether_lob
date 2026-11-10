@@ -2,11 +2,17 @@
 // matching thread -> OrderBook, with open-loop Poisson arrivals.
 //
 // Usage: aether_bench_pipeline [messages=2000000] [rate_per_sec=1000000]
+//                              [gateway_core=auto] [matching_core=auto]
+//
+// The gateway (this process's main thread) and the matching thread are placed
+// on separate physical cores: "auto" takes default_core_plan(), a number names
+// a core explicitly and -1 leaves that thread unpinned. The placement outcome
+// is verified and printed before any message is sent.
 //
 // Three latency distributions are reported, all ending when the matching
 // thread has finished applying the command (all of its fills done):
 //
-//   queue+match    from gateway queue insertion (Command::ingress_ns)
+//   queue+match    from gateway queue insertion (Command::enqueue_ticks)
 //   tick-to-trade  the same measure, restricted to commands that traded
 //   vs schedule    from the message's *scheduled* Poisson arrival time. This
 //                  one also charges any time the producer ran late, so it is
@@ -14,12 +20,13 @@
 //                  when the system is close to saturation.
 //
 // Figures include two clock reads per message and are quantised to the
-// platform timer tick (~41 ns on Apple Silicon). Threads are not pinned.
+// platform timer tick (~41 ns on Apple Silicon).
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <span>
 #include <vector>
 
@@ -116,7 +123,7 @@ public:
 
     void on_processed(const Command& command, const AddResult&) noexcept override {
         const std::uint64_t now = now_ns();
-        const std::uint32_t since_insert = saturate(now - command.ingress_ns);
+        const std::uint32_t since_insert = saturate(tsc::elapsed_ns(command.enqueue_ticks, tsc::now_end()));
         const std::uint64_t scheduled = start_ns + arrivals_[from_insert.size()];
         from_schedule.push_back(saturate(now > scheduled ? now - scheduled : 0));
         from_insert.push_back(since_insert);
@@ -139,25 +146,30 @@ private:
 
 void report(const char* label, std::vector<std::uint32_t>& samples) {
     if (samples.empty()) {
-        std::printf("  %-14s (no samples)\n", label);
+        std::printf("  | %-13s | %9s |\n", label, "no samples");
         return;
     }
     std::sort(samples.begin(), samples.end());
     const auto at = [&](double q) {
         return samples[static_cast<std::size_t>(q * static_cast<double>(samples.size() - 1))];
     };
-    std::printf("  %-14s n=%-8zu p50=%-6u p90=%-6u p99=%-7u p99.9=%-8u p99.99=%-8u max=%u\n", label,
-                samples.size(), at(0.50), at(0.90), at(0.99), at(0.999), at(0.9999), samples.back());
+    std::printf("  | %-13s | %9zu | %6u | %6u | %6u | %7u | %8u |\n", label, samples.size(), at(0.50), at(0.90),
+                at(0.99), at(0.999), samples.back());
 }
 
 const BookConfig kBook{.max_orders = 1U << 22, .max_levels = 1U << 12};
 
+CorePlan g_cores;  // placement shared by both passes
+
 void run_poisson(const Flow& flow, std::size_t count, double rate) {
     const std::vector<std::uint64_t> arrivals = poisson_schedule(count, rate);
     LatencyRecorder recorder(count, arrivals);
-    Engine engine({.book = kBook, .queue_capacity = 1U << 16, .idle_spins_before_yield = UINT32_MAX},
+    Engine engine({.book = kBook,
+                   .queue_capacity = 1U << 16,
+                   .idle_spins_before_yield = UINT32_MAX,
+                   .matching_core = g_cores.matching_core},
                   &recorder);
-    engine.start();
+    engine.start();  // returns after the matching thread has pinned itself and logged the result
 
     const std::span<const std::byte> bytes(flow.bytes);
     const std::uint64_t start = now_ns() + 1'000'000;  // let the matching thread settle into its spin
@@ -178,14 +190,21 @@ void run_poisson(const Flow& flow, std::size_t count, double rate) {
     std::printf("  messages=%zu trades=%llu backpressure_events=%llu resting_orders=%zu  (latencies in ns)\n",
                 count, static_cast<unsigned long long>(recorder.trades),
                 static_cast<unsigned long long>(engine.backpressure_events()), engine.book().order_count());
+    std::printf("  | %-13s | %9s | %6s | %6s | %6s | %7s | %8s |\n", "latency (ns)", "samples", "p50", "p90",
+                "p99", "p99.9", "max");
+    std::printf("  |---------------|-----------|--------|--------|--------|---------|----------|\n");
     report("queue+match", recorder.from_insert);
     report("tick-to-trade", recorder.tick_to_trade);
     report("vs schedule", recorder.from_schedule);
 }
 
 void run_saturation(const Flow& flow, std::size_t count) {
-    Engine engine({.book = kBook, .queue_capacity = 1U << 16, .idle_spins_before_yield = UINT32_MAX,
-                   .stamp_ingress = false});
+    Engine engine({.book = kBook,
+                   .queue_capacity = 1U << 16,
+                   .idle_spins_before_yield = UINT32_MAX,
+                   .stamp_ingress = false,
+                   .matching_core = g_cores.matching_core,
+                   .log_affinity = false});
     engine.start();
     const std::uint64_t start = now_ns();
     const IngestResult result = engine.ingest(flow.bytes);
@@ -208,9 +227,21 @@ int main(int argc, char** argv) {
     const std::size_t count = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 2'000'000;
     const double rate = argc > 2 ? std::strtod(argv[2], nullptr) : 1'000'000.0;
     if (count == 0 || !(rate > 0.0)) {
-        std::fprintf(stderr, "usage: %s [messages > 0] [rate_per_sec > 0]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [messages > 0] [rate_per_sec > 0] [gateway_core|auto] [matching_core|auto]\n",
+                     argv[0]);
         return 2;
     }
+
+    // Thread placement, decided and verified before anything is measured.
+    g_cores = default_core_plan();
+    if (argc > 3 && std::strcmp(argv[3], "auto") != 0) g_cores.gateway_core = std::atoi(argv[3]);
+    if (argc > 4 && std::strcmp(argv[4], "auto") != 0) g_cores.matching_core = std::atoi(argv[4]);
+    if (g_cores.gateway_core >= 0 && g_cores.matching_core >= 0 &&
+        same_physical_core(g_cores.gateway_core, g_cores.matching_core)) {
+        std::fprintf(stderr, "gateway and matching threads must be on different physical cores\n");
+        return 2;
+    }
+    log_pin(stderr, "gateway thread (main)", pin_current_thread(g_cores.gateway_core));
 
     const Flow flow = generate_flow(count);
     std::printf("AetherLOB pipeline bench: %zu wire messages, %zu bytes\n", count, flow.bytes.size());
