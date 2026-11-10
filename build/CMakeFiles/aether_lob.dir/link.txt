@@ -1,2 +1,0 @@
-/usr/bin/ar qc libaether_lob.a CMakeFiles/aether_lob.dir/src/arena.cpp.o CMakeFiles/aether_lob.dir/src/order_book.cpp.o
-/usr/bin/ranlib libaether_lob.a
