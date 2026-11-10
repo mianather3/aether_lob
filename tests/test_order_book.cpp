@@ -9,20 +9,11 @@
 #include <vector>
 
 #include "order_book.hpp"
+#include "test_common.hpp"
 
 using namespace aether;
 
 namespace {
-
-int g_failures = 0;
-
-#define CHECK(cond)                                                         \
-    do {                                                                    \
-        if (!(cond)) {                                                      \
-            std::printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);   \
-            ++g_failures;                                                   \
-        }                                                                   \
-    } while (false)
 
 bool same(const Trade& a, const Trade& b) {
     return a.maker_id == b.maker_id && a.taker_id == b.taker_id && a.price == b.price &&
@@ -277,25 +268,49 @@ void test_differential_against_reference() {
                 book.order_count(), book.level_count());
 }
 
-void run(const char* name, void (*test)()) {
-    const int before = g_failures;
-    std::printf("[ RUN  ] %s\n", name);
-    test();
-    std::printf("[ %s ] %s\n", g_failures == before ? " OK " : "FAIL", name);
+void test_market_order() {
+    OrderBook book({.max_orders = 64, .max_levels = 16});
+    CHECK(book.add_market(Side::Buy, 0).status == Status::InvalidQty);
+
+    // Against an empty side nothing fills and nothing rests.
+    AddResult r = book.add_market(Side::Buy, 10);
+    CHECK(r.status == Status::Ok && r.filled == 0 && r.resting == 0);
+    CHECK(book.order_count() == 0);
+
+    book.add_limit(1, Side::Sell, 100, 5);
+    book.add_limit(2, Side::Sell, 100, 5);
+    book.add_limit(3, Side::Sell, 105, 5);
+    book.add_limit(4, Side::Buy, 90, 7);
+
+    // Sweeps price levels best-first, FIFO within a level, at the makers' prices.
+    std::vector<Trade> trades;
+    r = book.add_market(Side::Buy, 12, [&](const Trade& t) { trades.push_back(t); });
+    CHECK(r.status == Status::Ok && r.filled == 12 && r.resting == 0);
+    CHECK(trades.size() == 3);
+    CHECK(same(trades[0], Trade{1, kMarketTakerId, 100, 5, Side::Buy}));
+    CHECK(same(trades[1], Trade{2, kMarketTakerId, 100, 5, Side::Buy}));
+    CHECK(same(trades[2], Trade{3, kMarketTakerId, 105, 2, Side::Buy}));
+    CHECK(book.best_ask()->price == 105 && book.best_ask()->total_qty == 3);
+
+    // Exhausting the book cancels the unfilled remainder instead of resting it.
+    r = book.add_market(Side::Sell, 100);
+    CHECK(r.status == Status::Ok && r.filled == 7 && r.resting == 0);
+    CHECK(book.best_bid() == nullptr);
+    CHECK(book.order_count() == 1);
+    CHECK(book.check_invariants());
 }
 
 }  // namespace
 
 int main() {
+    using aether_test::run;
     run("layout", test_layout);
+    run("market_order", test_market_order);
     run("empty_and_rejects", test_empty_and_rejects);
     run("price_priority_and_level_order", test_price_priority_and_level_order);
     run("fifo_time_priority", test_fifo_time_priority);
     run("partial_fill_rests_remainder", test_partial_fill_rests_remainder);
     run("arena_exhaustion_and_reuse", test_arena_exhaustion_and_reuse);
     run("differential_against_reference", test_differential_against_reference);
-
-    std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL TESTS PASSED" : "TESTS FAILED",
-                g_failures, g_failures == 1 ? "" : "s");
-    return g_failures == 0 ? 0 : 1;
+    return aether_test::summary();
 }

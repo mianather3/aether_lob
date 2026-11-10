@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 
 #include "arena.hpp"
@@ -31,6 +32,8 @@ using Price = std::int64_t;  // integer ticks; no floating point anywhere
 using Qty = std::uint64_t;
 
 enum class Side : std::uint8_t { Buy = 0, Sell = 1 };
+
+inline constexpr OrderId kMarketTakerId = 0;  // taker_id reported for market orders
 
 enum class Status : std::uint8_t {
     Ok,
@@ -108,25 +111,7 @@ public:
             return {Status::DuplicateId, 0, 0};
         }
 
-        BookSide& opposite = sides_[1 - index_of(side)];
-        Qty remaining = qty;
-        while (remaining != 0) {
-            PriceLevel* best = opposite.levels.front();
-            if (best == nullptr || !crosses(side, price, best->price)) {
-                break;
-            }
-            Order* maker = best->orders.front();
-            const Qty fill = remaining < maker->qty ? remaining : maker->qty;
-            const Trade trade{maker->id, id, best->price, fill, side};
-            maker->qty -= fill;
-            best->total_qty -= fill;
-            remaining -= fill;
-            if (maker->qty == 0) {
-                remove_order(maker, opposite);
-            }
-            on_trade(trade);
-        }
-
+        const Qty remaining = match(id, side, price, qty, on_trade);
         if (remaining != 0) {
             rest(id, side, price, remaining);
         }
@@ -135,6 +120,24 @@ public:
 
     AddResult add_limit(OrderId id, Side side, Price price, Qty qty) {
         return add_limit(id, side, price, qty, [](const Trade&) noexcept {});
+    }
+
+    // Market order: sweeps the opposite side at any price. Whatever cannot be
+    // filled is cancelled (never rests), so it needs no arena capacity and no
+    // order id; its trades carry taker_id == kMarketTakerId.
+    template <class OnTrade>
+    AddResult add_market(Side side, Qty qty, OnTrade&& on_trade) {
+        if (qty == 0) [[unlikely]] {
+            return {Status::InvalidQty, 0, 0};
+        }
+        const Price any_price = side == Side::Buy ? std::numeric_limits<Price>::max()
+                                                  : std::numeric_limits<Price>::min();
+        const Qty remaining = match(kMarketTakerId, side, any_price, qty, on_trade);
+        return {Status::Ok, qty - remaining, 0};
+    }
+
+    AddResult add_market(Side side, Qty qty) {
+        return add_market(side, qty, [](const Trade&) noexcept {});
     }
 
     Status cancel(OrderId id) noexcept {
@@ -178,6 +181,30 @@ private:
     // True if price `a` has priority over price `b` on `side`.
     static constexpr bool better(Side side, Price a, Price b) noexcept {
         return side == Side::Buy ? a > b : a < b;
+    }
+
+    // Executes against the opposite side in price-time order while `limit`
+    // crosses. Returns the unfilled quantity.
+    template <class OnTrade>
+    Qty match(OrderId taker_id, Side side, Price limit, Qty remaining, OnTrade& on_trade) {
+        BookSide& opposite = sides_[1 - index_of(side)];
+        while (remaining != 0) {
+            PriceLevel* best = opposite.levels.front();
+            if (best == nullptr || !crosses(side, limit, best->price)) {
+                break;
+            }
+            Order* maker = best->orders.front();
+            const Qty fill = remaining < maker->qty ? remaining : maker->qty;
+            const Trade trade{maker->id, taker_id, best->price, fill, side};
+            maker->qty -= fill;
+            best->total_qty -= fill;
+            remaining -= fill;
+            if (maker->qty == 0) {
+                remove_order(maker, opposite);
+            }
+            on_trade(trade);
+        }
+        return remaining;
     }
 
     void rest(OrderId id, Side side, Price price, Qty qty) noexcept {

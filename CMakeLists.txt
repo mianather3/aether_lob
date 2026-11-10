@@ -22,7 +22,8 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -g -DNDEBUG")
 
 option(AETHER_WARNINGS_AS_ERRORS "Fail the build on any compiler warning" ON)
 option(AETHER_NATIVE_ARCH "Tune for the build machine's CPU (-march=native)" ON)
-option(AETHER_SANITIZE "Build with AddressSanitizer + UBSan" OFF)
+set(AETHER_SANITIZER "none" CACHE STRING "Sanitizer build: none, address (ASan + UBSan) or thread (TSan)")
+set_property(CACHE AETHER_SANITIZER PROPERTY STRINGS none address thread)
 
 # ---- Shared compile options --------------------------------------------------
 add_library(aether_options INTERFACE)
@@ -46,25 +47,51 @@ if(AETHER_NATIVE_ARCH)
     endif()
 endif()
 
-if(AETHER_SANITIZE)
-    target_compile_options(aether_options INTERFACE -fsanitize=address,undefined -fno-omit-frame-pointer)
-    target_link_options(aether_options INTERFACE -fsanitize=address,undefined)
+# ASan and TSan cannot be combined, so each gets its own build tree, e.g.
+#   cmake -B build-tsan -DAETHER_SANITIZER=thread && cmake --build build-tsan
+if(AETHER_SANITIZER STREQUAL "address")
+    set(AETHER_SANITIZER_FLAGS -fsanitize=address,undefined -fno-sanitize-recover=undefined)
+elseif(AETHER_SANITIZER STREQUAL "thread")
+    set(AETHER_SANITIZER_FLAGS -fsanitize=thread)
+elseif(NOT AETHER_SANITIZER STREQUAL "none")
+    message(FATAL_ERROR "AETHER_SANITIZER must be none, address or thread (got '${AETHER_SANITIZER}')")
+endif()
+if(AETHER_SANITIZER_FLAGS)
+    target_compile_options(aether_options INTERFACE ${AETHER_SANITIZER_FLAGS} -g -fno-omit-frame-pointer)
+    target_link_options(aether_options INTERFACE ${AETHER_SANITIZER_FLAGS})
 endif()
 
 # ---- Core library ------------------------------------------------------------
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 add_library(aether_lob STATIC
     src/arena.cpp
-    src/order_book.cpp)
+    src/order_book.cpp
+    src/engine.cpp)
 add_library(aether::lob ALIAS aether_lob)
 target_include_directories(aether_lob PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(aether_lob PUBLIC aether_options)
+target_link_libraries(aether_lob PUBLIC aether_options Threads::Threads)
 
 # ---- Tests -------------------------------------------------------------------
 include(CTest)
-add_executable(aether_tests tests/test_order_book.cpp)
-target_link_libraries(aether_tests PRIVATE aether::lob)
-add_test(NAME aether_tests COMMAND aether_tests)
+function(aether_add_test name source)
+    add_executable(${name} ${source})
+    target_link_libraries(${name} PRIVATE aether::lob)
+    add_test(NAME ${name} COMMAND ${name})
+    # Any sanitizer report fails the test instead of just being printed.
+    set_tests_properties(${name} PROPERTIES
+        ENVIRONMENT "TSAN_OPTIONS=halt_on_error=1;ASAN_OPTIONS=halt_on_error=1;UBSAN_OPTIONS=halt_on_error=1"
+        TIMEOUT 600)
+endfunction()
+
+aether_add_test(aether_tests tests/test_order_book.cpp)
+aether_add_test(aether_test_spsc_queue tests/test_spsc_queue.cpp)
+aether_add_test(aether_test_engine tests/test_engine.cpp)
 
 # ---- Benchmarks --------------------------------------------------------------
 add_executable(aether_bench bench/bench_order_book.cpp)
 target_link_libraries(aether_bench PRIVATE aether::lob)
+
+add_executable(aether_bench_pipeline bench/bench_pipeline.cpp)
+target_link_libraries(aether_bench_pipeline PRIVATE aether::lob)
