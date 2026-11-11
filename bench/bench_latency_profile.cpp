@@ -16,11 +16,21 @@
 //                   means the *producer* could not keep up, and the engine
 //                   latencies above then understate what a client would see.
 //
-// The replay: a deep seeded book (40,000 resting orders over 800 price
-// levels), then a drifting mid with passive adds, deep resting adds, cancels,
-// modifications (cancel + re-add, which is what a price change is: the order
-// loses its queue position), marketable limit orders and multi-level market
-// sweeps. While it runs, a separate exporter thread pulls live L2 snapshots.
+// The replay: a deep seeded book (40,000 resting orders over 200 price levels
+// a side), then a stationary flow of
+//   55%  resting limit adds   (70% within 10 ticks of the touch, 30% up to 200 ticks deep)
+//   25%  cancels              (of orders that are really resting, plus the odd stale id:
+//                              a cancel that loses the race with a fill, i.e. a reject)
+//   20%  aggressive orders    (15% marketable limits crossing 0-2 ticks through the touch,
+//                              5% multi-level market sweeps)
+// The generator runs its own OrderBook alongside so that it prices orders off
+// the real touch and cancels orders that exist, and it scales aggressive size
+// by (resting orders / 40,000): taker flow thins out as the book thins and
+// grows as it fills, which is what keeps the depth stationary over millions of
+// messages. The depth it leaves behind is sampled throughout and printed, and
+// the run aborts if the book ever gets shallower than kMinRestingOrders or
+// kMinLevelsPerSide. While the flow runs, a separate exporter thread pulls
+// live L2 snapshots.
 //
 // A final single-threaded pass measures the matching core alone: time per
 // command and per matched fill, plus CPU cycles and instructions where the OS
@@ -70,40 +80,79 @@ struct XorShift64 {
 const BookConfig kBook{.max_orders = 1U << 22, .max_levels = 1U << 15};
 constexpr Price kStartMid = 1'000'000;
 
+// The depth the replay must sustain from the first message to the last.
+constexpr std::size_t kTargetRestingOrders = 40'000;
+constexpr std::size_t kMinRestingOrders = 10'000;
+constexpr std::size_t kMinLevelsPerSide = 50;
+constexpr Price kNearTouchTicks = 50;
+constexpr std::size_t kDepthSampleEvery = 1024;  // messages between depth samples
+
+struct DepthTrace {
+    std::size_t samples{0};
+    std::size_t min_orders{SIZE_MAX}, max_orders{0};
+    std::size_t min_levels_per_side{SIZE_MAX};  // the thinner side, at its thinnest
+    std::size_t min_orders_near_touch{SIZE_MAX};  // resting within kNearTouchTicks of the touch, both sides
+    Price min_mid{kStartMid}, max_mid{kStartMid};
+
+    void sample(const OrderBook& book) noexcept {
+        std::size_t near_touch = 0;
+        for (const Side side : {Side::Buy, Side::Sell}) {
+            const PriceLevel* const best = book.best(side);
+            std::size_t levels = 0;
+            for (const PriceLevel* level = best; level != nullptr; level = level->next) {
+                ++levels;
+                const Price away = side == Side::Buy ? best->price - level->price : level->price - best->price;
+                if (away < kNearTouchTicks) near_touch += level->order_count;
+            }
+            if (levels < min_levels_per_side) min_levels_per_side = levels;
+        }
+        const std::size_t orders = book.order_count();
+        if (orders < min_orders) min_orders = orders;
+        if (orders > max_orders) max_orders = orders;
+        if (near_touch < min_orders_near_touch) min_orders_near_touch = near_touch;
+        if (book.best_bid() != nullptr && book.best_ask() != nullptr) {
+            const Price mid = (book.best_bid()->price + book.best_ask()->price) / 2;
+            if (mid < min_mid) min_mid = mid;
+            if (mid > max_mid) max_mid = mid;
+        }
+        ++samples;
+    }
+};
+
 struct Replay {
     std::vector<Command> seed;           // resting book built before measurement starts
     std::vector<std::byte> bytes;        // the measured flow, wire-encoded
     std::vector<std::uint32_t> offsets;  // message i is bytes[offsets[i], offsets[i + 1])
-    std::uint64_t adds{0}, cancels{0}, modifies{0}, aggressive{0}, sweeps{0};
+    std::uint64_t resting_adds{0}, cancels{0}, stale_cancels{0}, marketable{0}, sweeps{0};
+    DepthTrace depth;
 };
 
 Replay generate_replay(std::size_t messages) {
     Replay replay;
     replay.bytes.reserve(messages * kMaxWireMsgSize);
-    replay.offsets.reserve(messages + 2);
+    replay.offsets.reserve(messages + 1);
     XorShift64 rng{0xA57E12B00C0FFEEULL};
 
-    struct Live {
-        OrderId id;
-        Side side;
-    };
-    std::vector<Live> live;
-    live.reserve(messages);
+    // The generator's own copy of the book: every message is applied to it as
+    // it is emitted, so it always knows the touch and which orders still rest.
+    const auto shadow = std::make_unique<OrderBook>(kBook);
+    std::vector<OrderId> candidates;  // ids that were resting when added; may have filled since
+    candidates.reserve(messages);
     OrderId next_id = 1;
-    Price mid = kStartMid;
 
-    // Deep book: 400 levels per side, 50 orders per level.
-    for (Price depth = 1; depth <= 400; ++depth) {
-        for (int k = 0; k < 50; ++k) {
+    // Seed: 200 levels per side, 100 orders per level.
+    for (Price depth = 1; depth <= 200; ++depth) {
+        for (int k = 0; k < 100; ++k) {
             for (const Side side : {Side::Buy, Side::Sell}) {
                 Command cmd;
                 cmd.type = CommandType::Add;
                 cmd.order_id = next_id++;
                 cmd.side = side;
-                cmd.price = side == Side::Buy ? mid - depth : mid + depth;
+                cmd.price = side == Side::Buy ? kStartMid - depth : kStartMid + depth;
                 cmd.qty = 50 + rng.below(400);
                 replay.seed.push_back(cmd);
-                live.push_back({cmd.order_id, side});
+                shadow->add_limit(cmd.order_id, cmd.side, cmd.price, cmd.qty);
+                candidates.push_back(cmd.order_id);
             }
         }
     }
@@ -115,48 +164,73 @@ Replay generate_replay(std::size_t messages) {
     const auto add = [&](Side side, Price price, std::uint32_t qty) {
         const OrderId id = next_id++;
         emit(make_add(id, side, price, qty));
-        live.push_back({id, side});
+        if (shadow->add_limit(id, side, price, qty).resting != 0) candidates.push_back(id);
     };
-    const auto take_live = [&]() {
-        const std::size_t pick = rng.below(live.size());
-        const Live order = live[pick];
-        live[pick] = live.back();
-        live.pop_back();
-        return order;
+    // The far touch as `side` sees it: the price a passive order must stay
+    // short of and an aggressive one must reach.
+    const auto far_touch = [&](Side side) {
+        const PriceLevel* const far = shadow->best(side == Side::Buy ? Side::Sell : Side::Buy);
+        if (far != nullptr) return far->price;
+        const PriceLevel* const own = shadow->best(side);  // one side empty: quote around the other
+        if (own != nullptr) return side == Side::Buy ? own->price + 1 : own->price - 1;
+        return kStartMid;
     };
 
+    int drift = 0;  // -1, 0, +1: which way the taker flow leans in this regime
     while (replay.offsets.size() < messages) {
-        if (replay.offsets.size() % 64 == 0) mid += static_cast<Price>(rng.below(3)) - 1;  // drifting market
-        const std::uint64_t roll = rng.below(100);
-        const Side side = (rng() & 1) != 0 ? Side::Buy : Side::Sell;
-        const auto away = [&](Price ticks) { return side == Side::Buy ? mid - ticks : mid + ticks; };
+        const std::size_t sent = replay.offsets.size();
+        if (sent % kDepthSampleEvery == 0) replay.depth.sample(*shadow);
+        if (sent % 65536 == 0) drift = static_cast<int>(rng.below(3)) - 1;
 
-        if (roll < 34 || live.empty()) {  // passive order near the touch
-            add(side, away(1 + static_cast<Price>(rng.below(10))), static_cast<std::uint32_t>(1 + rng.below(200)));
-            ++replay.adds;
-        } else if (roll < 42) {  // deep resting liquidity
-            add(side, away(20 + static_cast<Price>(rng.below(380))), static_cast<std::uint32_t>(100 + rng.below(1900)));
-            ++replay.adds;
-        } else if (roll < 70) {  // cancellation (some targets have already traded: a real-world reject)
-            emit(make_cancel(take_live().id));
+        const std::uint64_t roll = rng.below(100);
+        if (roll < 55) {  // resting limit add: never crosses
+            const Side side = (rng() & 1) != 0 ? Side::Buy : Side::Sell;
+            const bool deep = rng.below(10) < 3;
+            const Price ticks = deep ? 11 + static_cast<Price>(rng.below(190)) : 1 + static_cast<Price>(rng.below(10));
+            const auto qty = static_cast<std::uint32_t>(deep ? 100 + rng.below(900) : 1 + rng.below(200));
+            const Price touch = far_touch(side);
+            add(side, side == Side::Buy ? touch - ticks : touch + ticks, qty);
+            ++replay.resting_adds;
+        } else if (roll < 80) {  // cancel
+            OrderId target = 0;
+            bool stale = false;
+            while (!candidates.empty()) {
+                const std::size_t pick = rng.below(candidates.size());
+                target = candidates[pick];
+                candidates[pick] = candidates.back();
+                candidates.pop_back();
+                if (shadow->find(target) != nullptr) break;
+                // Already filled. Mostly skip it; now and then send the cancel
+                // anyway, as a client that has not seen the fill yet would.
+                if (rng.below(16) == 0) {
+                    stale = true;
+                    break;
+                }
+            }
+            emit(make_cancel(target));  // id 0 never rests: a reject, only if nothing is left to cancel
+            shadow->cancel(target);
             ++replay.cancels;
-        } else if (roll < 82) {  // modification: cancel, then re-enter at a new price and size
-            const Live old = take_live();
-            emit(make_cancel(old.id));
-            const Price ticks = 1 + static_cast<Price>(rng.below(12));
-            add(old.side, old.side == Side::Buy ? mid - ticks : mid + ticks, static_cast<std::uint32_t>(1 + rng.below(250)));
-            ++replay.modifies;
-        } else if (roll < 94) {  // marketable limit: crosses 1-3 ticks through the touch
-            add(side, away(-(1 + static_cast<Price>(rng.below(3)))), static_cast<std::uint32_t>(50 + rng.below(550)));
-            ++replay.aggressive;
-        } else {  // market sweep through several levels
-            emit(make_market(side, static_cast<std::uint32_t>(2000 + rng.below(18000))));
-            ++replay.sweeps;
+            if (stale) ++replay.stale_cancels;
+        } else {  // aggressive: sized in proportion to the depth that is there to take
+            const Side side = rng.below(100) < static_cast<std::uint64_t>(50 + 8 * drift) ? Side::Buy : Side::Sell;
+            double scale = static_cast<double>(shadow->order_count()) / static_cast<double>(kTargetRestingOrders);
+            scale = scale < 0.25 ? 0.25 : (scale > 4.0 ? 4.0 : scale);
+            if (roll < 95) {  // marketable limit: crosses 0-2 ticks through the touch, remainder rests
+                const Price through = static_cast<Price>(rng.below(3));
+                const Price touch = far_touch(side);
+                const auto qty = static_cast<std::uint32_t>(1.0 + scale * static_cast<double>(10 + rng.below(140)));
+                add(side, side == Side::Buy ? touch + through : touch - through, qty);
+                ++replay.marketable;
+            } else {  // market sweep through several levels
+                const auto qty = static_cast<std::uint32_t>(1.0 + scale * static_cast<double>(200 + rng.below(600)));
+                emit(make_market(side, qty));
+                shadow->add_market(side, qty);
+                ++replay.sweeps;
+            }
         }
     }
-    // End sentinel. A modification emits two messages, so there may be one
-    // more than asked for; either way offsets[i + 1] exists for every i < messages.
-    replay.offsets.push_back(static_cast<std::uint32_t>(replay.bytes.size()));
+    replay.depth.sample(*shadow);
+    replay.offsets.push_back(static_cast<std::uint32_t>(replay.bytes.size()));  // end sentinel
     return replay;
 }
 
@@ -457,10 +531,25 @@ int main(int argc, char** argv) {
         if (n > largest) largest = n;
     }
     const Replay replay = generate_replay(largest);
-    std::printf("  replay: %zu seeded resting orders, then %zu messages = %llu adds, %llu cancels, %llu modifies "
-                "(cancel+add), %llu marketable limits, %llu market sweeps\n",
-                replay.seed.size(), largest, ull(replay.adds), ull(replay.cancels), ull(replay.modifies),
-                ull(replay.aggressive), ull(replay.sweeps));
+    const DepthTrace& depth = replay.depth;
+    const double pct = 100.0 / static_cast<double>(largest);
+    std::printf("  replay: %zu seeded resting orders, then %zu messages = %llu resting adds (%.1f%%), %llu cancels "
+                "(%.1f%%, %llu of them stale), %llu marketable limits + %llu market sweeps (%.1f%%)\n",
+                replay.seed.size(), largest, ull(replay.resting_adds), static_cast<double>(replay.resting_adds) * pct,
+                ull(replay.cancels), static_cast<double>(replay.cancels) * pct, ull(replay.stale_cancels),
+                ull(replay.marketable), ull(replay.sweeps),
+                static_cast<double>(replay.marketable + replay.sweeps) * pct);
+    std::printf("  book depth over the replay (%zu samples): resting orders %zu..%zu, thinner side never below %zu "
+                "price levels,\n"
+                "    never fewer than %zu orders within %lld ticks of the touch, mid moved %lld..%lld ticks from its start\n",
+                depth.samples, depth.min_orders, depth.max_orders, depth.min_levels_per_side,
+                depth.min_orders_near_touch, static_cast<long long>(kNearTouchTicks),
+                static_cast<long long>(depth.min_mid - kStartMid), static_cast<long long>(depth.max_mid - kStartMid));
+    if (depth.min_orders < kMinRestingOrders || depth.min_levels_per_side < kMinLevelsPerSide) {
+        std::fprintf(stderr, "replay FAILED to sustain liquidity: need >= %zu resting orders and >= %zu levels a side\n",
+                     kMinRestingOrders, kMinLevelsPerSide);
+        return 1;
+    }
 
     std::vector<RunResult> runs;
     for (std::size_t i = 0; i < rates.size(); ++i) {

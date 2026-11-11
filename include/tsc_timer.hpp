@@ -149,11 +149,17 @@ inline const Calibration& calibrate() noexcept {
 }
 
 // Converts a tick *difference* to nanoseconds. Hot path: one multiply and one
-// shift; intervals longer than 2^32 ticks take a slower exact path.
+// shift. Intervals longer than 2^32 ticks would overflow that multiply, so
+// they are split into two 32-bit halves and use the same multiplier: the two
+// paths are one function, continuous and monotonic across the boundary.
+// (Converting the long path through the double `ns_per_tick` instead is not:
+// the multiplier is rounded to 2^-24 ns, which at 2^32 ticks is up to 128 ns
+// away from the double, in either direction.)
 [[nodiscard]] inline std::uint64_t to_ns(std::uint64_t ticks) noexcept {
     const Calibration& c = detail::g_calibration;
     if ((ticks >> 32) != 0) [[unlikely]] {
-        return static_cast<std::uint64_t>(static_cast<double>(ticks) * c.ns_per_tick);
+        return (((ticks >> 32) * c.multiplier) << (32 - detail::kFixedPointShift)) +
+               (((ticks & 0xFFFF'FFFFULL) * c.multiplier) >> detail::kFixedPointShift);
     }
     return (ticks * c.multiplier) >> detail::kFixedPointShift;
 }
