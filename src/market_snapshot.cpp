@@ -215,7 +215,7 @@ void print_metrics(std::FILE* out, const TelemetrySnapshot& m) noexcept {
     row("ingest->queue", m.ingest_to_queue);
     row("queue->match", m.queue_to_match);
     row("match service", m.match_service);
-    row("tick-to-trade", m.tick_to_trade);
+    row("order-processing latency", m.tick_to_trade);
 }
 
 void print_snapshot(std::FILE* out, const L2Snapshot& s, std::uint32_t max_levels) noexcept {

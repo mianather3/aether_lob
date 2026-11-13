@@ -13,7 +13,7 @@
 // thread has finished applying the command (all of its fills done):
 //
 //   queue+match    from gateway queue insertion (Command::enqueue_ticks)
-//   tick-to-trade  the same measure, restricted to commands that traded
+//   order-processing latency  the same measure, restricted to commands that traded
 //   vs schedule    from the message's *scheduled* Poisson arrival time. This
 //                  one also charges any time the producer ran late, so it is
 //                  free of coordinated omission and is the number to trust
@@ -194,7 +194,7 @@ void run_poisson(const Flow& flow, std::size_t count, double rate) {
                 "p99", "p99.9", "max");
     std::printf("  |---------------|-----------|--------|--------|--------|---------|----------|\n");
     report("queue+match", recorder.from_insert);
-    report("tick-to-trade", recorder.tick_to_trade);
+    report("order-processing latency", recorder.tick_to_trade);
     report("vs schedule", recorder.from_schedule);
 }
 

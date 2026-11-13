@@ -255,11 +255,11 @@ void test_engine_counters_match_ground_truth() {
     CHECK(m.invalid_bytes == 0 && m.checksum_errors == 0);
     CHECK(m.backpressure_waits == engine.backpressure_events());
 
-    // One latency sample per command; tick-to-trade only for commands that traded.
+    // One latency sample per command; order-processing latency only for commands that traded.
     CHECK(m.ingest_to_queue.count == kMessages && m.queue_to_match.count == kMessages);
     CHECK(m.match_service.count == kMessages);
     CHECK(m.tick_to_trade.count == truth.commands_with_fills && m.tick_to_trade.count > 0);
-    // Intervals nest: the matching step is inside queue->match, which is inside tick-to-trade.
+    // Intervals nest: the matching step is inside queue->match, which is inside order-processing latency.
     CHECK(m.match_service.max <= m.queue_to_match.max);
     CHECK(m.tick_to_trade.max <= m.queue_to_match.max + m.ingest_to_queue.max);
     CHECK(m.queue_to_match.p50 <= m.queue_to_match.p99 && m.queue_to_match.p99 <= m.queue_to_match.max);

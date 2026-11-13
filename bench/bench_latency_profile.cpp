@@ -10,7 +10,7 @@
 //   ingest->queue   packet received by the gateway -> command pushed to the queue
 //   queue->match    pushed to the queue -> match completed (queue wait + matching)
 //   match service   popped by the matching thread -> match completed
-//   tick-to-trade   packet received -> match completed, for commands that traded
+//   order-processing latency   packet received -> match completed, for commands that traded
 //   schedule lag    how late the producer sent each message versus its Poisson
 //                   due time (measured here, not by the engine). Non-zero lag
 //                   means the *producer* could not keep up, and the engine
@@ -341,7 +341,7 @@ void print_run(const RunResult& r) {
     print_row("ingest->queue", m.ingest_to_queue);
     print_row("queue->match", m.queue_to_match);
     print_row("match service", m.match_service);
-    print_row("tick-to-trade", m.tick_to_trade);
+    print_row("order-processing latency", m.tick_to_trade);
     print_row("schedule lag", r.schedule_lag);
 }
 
@@ -558,7 +558,7 @@ int main(int argc, char** argv) {
     }
 
     std::printf("\n=== Latency percentile matrix ===");
-    print_matrix("tick-to-trade: packet received -> match completed, commands that traded", runs,
+    print_matrix("order-processing latency: packet received -> match completed, commands that traded", runs,
                  &TelemetrySnapshot::tick_to_trade);
     print_matrix("ingestion-to-queue: packet received -> pushed to the SPSC queue", runs,
                  &TelemetrySnapshot::ingest_to_queue);

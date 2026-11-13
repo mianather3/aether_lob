@@ -8,8 +8,8 @@ last fill.
 
 | | |
 |---|---|
-| **Median tick-to-trade** | **125 ns** (packet received → last fill done, through the queue) |
-| **p99 tick-to-trade** | **~375 ns** at 1M msg/s (median of 12 runs) |
+| **Median order-processing** | **125 ns** (packet received → last fill done, through the queue) |
+| **p99 order-processing** | **~375 ns** at 1M msg/s (median of 12 runs) |
 | **Peak throughput** | **~20–21.6M msg/s** end to end (wire bytes → decode → queue → match) |
 | **Matching core alone** | ~25 ns per command, ~20 ns (~85 cycles) per fill |
 | **Hot-path allocations** | none, by construction: every byte is reserved and pre-faulted at start-up |
@@ -108,7 +108,7 @@ live L2 snapshots every 10 ms.
 Apple M5, macOS 26.5, Apple clang 21, `-O3 -march=native`. One representative
 run; latencies in nanoseconds.
 
-**Tick-to-trade** — packet received by the gateway → matching complete, for
+**Order-Processing Latency** — packet received by the gateway → matching complete, for
 commands that traded:
 
 | Rate (msg/s) | p50 | p90 | p99 | p99.9 | p99.99 | max |
@@ -152,7 +152,7 @@ commands:
   core isolation, so the p99.9+ columns measure the laptop, not the engine.
   p99 is consistently worst at the *lowest* rate, 100k msg/s, which points the
   same way: most likely the core is allowed to idle down between messages.
-- **What "tick-to-trade" covers.** Bytes handed to the gateway's decoder →
+- **What "Order-Processing Latency" covers.** Bytes handed to the gateway's decoder →
   last fill applied. It includes decode, the queue hop between two cores and
   matching. It excludes the kernel network stack and NIC, and there is no
   outbound order-entry leg.
